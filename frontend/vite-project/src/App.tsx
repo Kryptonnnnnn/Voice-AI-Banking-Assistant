@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 
-const BASE_URL = "http://127.0.0.1:8000";
+const BASE_URL = "https://voice-ai-banking-assistant-1.onrender.com";
 
 function App() {
   const [chat, setChat]               = useState<any[]>([]);
