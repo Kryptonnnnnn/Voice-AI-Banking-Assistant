@@ -10,8 +10,10 @@ function App() {
   const [kycActive, setKycActive]     = useState(false);
   const [botSpeaking, setBotSpeaking] = useState(false);
   const [permDenied, setPermDenied]   = useState(false);
-  // When true, an upload button appears inside the chat
   const [awaitingCheque, setAwaitingCheque] = useState(false);
+  const [started, setStarted]         = useState(false);
+  const [voiceUnsupported, setVoiceUnsupported] = useState(false);
+  const [botTyping, setBotTyping]     = useState(false);
 
   const recognitionRef   = useRef<any>(null);
   const fileInputRef     = useRef<HTMLInputElement>(null);
@@ -20,16 +22,27 @@ function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const listeningRef     = useRef(false);
   const pausedForSpeech  = useRef(false);
+  const networkErrCount  = useRef(0);
+  const finishTimerRef   = useRef<any>(null);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chat]);
+  }, [chat, botTyping]);
 
   useEffect(() => { listeningRef.current = listening; }, [listening]);
 
-  // ── TTS: pauses mic while speaking, resumes after ──
+  const resumeMic = useCallback(() => {
+    pausedForSpeech.current = false;
+    setBotSpeaking(false);
+    if (listeningRef.current && recognitionRef.current) {
+      try { recognitionRef.current.start(); } catch {}
+    }
+  }, []);
+
   const speak = useCallback((text: string, onDone?: () => void) => {
+    if (!window.speechSynthesis) { onDone?.(); return; }
     speechSynthesis.cancel();
+    if (finishTimerRef.current) clearTimeout(finishTimerRef.current);
 
     if (recognitionRef.current && listeningRef.current) {
       pausedForSpeech.current = true;
@@ -37,35 +50,98 @@ function App() {
     }
 
     setBotSpeaking(true);
+
     const utter = new SpeechSynthesisUtterance(text);
     utter.rate = 0.95;
-    utter.onend = () => {
-      setBotSpeaking(false);
-      if (pausedForSpeech.current) {
-        pausedForSpeech.current = false;
-        setTimeout(() => {
-          if (listeningRef.current && recognitionRef.current) {
-            try { recognitionRef.current.start(); } catch {}
-          }
-        }, 400);
-      }
+
+    let ended = false;
+    const finish = () => {
+      if (ended) return;
+      ended = true;
+      if (finishTimerRef.current) clearTimeout(finishTimerRef.current);
+      resumeMic();
       onDone?.();
     };
-    speechSynthesis.speak(utter);
-  }, []);
 
-  // ── Auto-start mic after welcome ──
-  useEffect(() => {
-    const msg = "Welcome to Kentiq AI Voice Bot from Dubai Bank Bank. How can I help you?";
-    setChat([{ bot: msg }]);
-    setTimeout(() => speak(msg, () => startVoice()), 400);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    utter.onend   = finish;
+    utter.onerror = finish;
+
+    const estimatedMs = Math.min(text.length * 60, 12000);
+    finishTimerRef.current = setTimeout(finish, estimatedMs + 1500);
+
+    speechSynthesis.speak(utter);
+  }, [resumeMic]);
+
+  const startVoice = useCallback(() => {
+    const SR =
+      (window as any).webkitSpeechRecognition ||
+      (window as any).SpeechRecognition;
+
+    if (!SR) { setVoiceUnsupported(true); return; }
+    if (recognitionRef.current && listeningRef.current) return;
+
+    const r = new SR();
+    r.lang            = "en-US";
+    r.continuous      = true;
+    r.interimResults  = false;
+    r.maxAlternatives = 1;
+
+    r.onstart = () => {
+      networkErrCount.current = 0;
+      if (!pausedForSpeech.current) setListening(true);
+    };
+
+    r.onresult = async (event: any) => {
+      const result     = event.results[event.results.length - 1];
+      if (!result.isFinal) return;
+      const text       = result[0].transcript.trim();
+      const confidence = result[0].confidence;
+      if (!text) return;
+      if (typeof confidence === "number" && confidence < 0.35) return;
+      await handleUser(text);
+    };
+
+    r.onerror = (event: any) => {
+      if (event.error === "aborted" || event.error === "no-speech") return;
+      if (event.error === "not-allowed") {
+        setListening(false); listeningRef.current = false; setPermDenied(true); return;
+      }
+      if (event.error === "audio-capture") {
+        setListening(false); listeningRef.current = false; return;
+      }
+      if (event.error === "network") {
+        networkErrCount.current += 1;
+        if (networkErrCount.current === 1) {
+          setChat((prev) => [...prev, { bot: "Voice recognition is unavailable on this network. Please type your messages below." }]);
+        }
+        setListening(false); listeningRef.current = false; return;
+      }
+    };
+
+    r.onend = () => {
+      if (listeningRef.current && !pausedForSpeech.current) {
+        try { r.start(); } catch {}
+      }
+    };
+
+    recognitionRef.current = r;
+    setListening(true);
+    listeningRef.current = true;
+    try { r.start(); } catch {}
   }, []);
 
   const addBotMsg = useCallback((text: string) => {
     setChat((prev) => [...prev, { bot: text }]);
     speak(text);
   }, [speak]);
+
+  const handleStart = () => {
+    setStarted(true);
+    const msg = "Welcome to Kentiq AI Voice Banking. How can I help you?";
+    setChat([{ bot: msg }]);
+    speak(msg);
+    startVoice();
+  };
 
   const sendText = async (text: string) => {
     try {
@@ -86,7 +162,6 @@ function App() {
     setChat((prev) => [...prev, { user: trimmed }]);
     const lower = trimmed.toLowerCase();
 
-    // Cheque triggers → show upload button inside chat (don't click hidden input here)
     if (
       lower.includes("upload cheque") || lower.includes("scan cheque") ||
       lower.includes("upload check")  || lower.includes("scan check")
@@ -96,76 +171,19 @@ function App() {
       return;
     }
 
-    // KYC
     if (
-      lower.includes("kyc")         || lower.includes("start kyc") ||
-      lower.includes("complete kyc")|| lower.includes("begin kyc")
+      lower.includes("kyc")          || lower.includes("start kyc") ||
+      lower.includes("complete kyc") || lower.includes("begin kyc")
     ) {
       startKYC();
       return;
     }
 
+    setBotTyping(true);
     const res = await sendText(trimmed);
+    setBotTyping(false);
     addBotMsg(res.response);
   };
-
-  // ── Continuous voice recognition ──
-  const startVoice = useCallback(() => {
-    const SR =
-      (window as any).webkitSpeechRecognition ||
-      (window as any).SpeechRecognition;
-
-    if (!SR) {
-      addBotMsg("Voice recognition is not supported. Please use Chrome or Edge.");
-      return;
-    }
-    if (recognitionRef.current && listeningRef.current) return;
-
-    const r = new SR();
-    r.lang              = "en-US";
-    r.continuous        = true;
-    r.interimResults    = false;
-    r.maxAlternatives   = 1;
-
-    r.onstart = () => { if (!pausedForSpeech.current) setListening(true); };
-
-    r.onresult = async (event: any) => {
-      const result     = event.results[event.results.length - 1];
-      if (!result.isFinal) return;
-      const text       = result[0].transcript.trim();
-      const confidence = result[0].confidence;
-      if (!text) return;
-      if (typeof confidence === "number" && confidence < 0.35) {
-        addBotMsg("Sorry, I didn't catch that. Could you please repeat?");
-        return;
-      }
-      await handleUser(text);
-    };
-
-    r.onerror = (event: any) => {
-      if (event.error === "aborted" || event.error === "no-speech") return;
-      setListening(false);
-      if (event.error === "not-allowed") setPermDenied(true);
-      const msgs: Record<string, string> = {
-        "not-allowed":   "Microphone access denied. Please allow it in your browser and refresh.",
-        "audio-capture": "No microphone detected. Please connect one and try again.",
-        "network":       "Network error during voice input. Check your connection.",
-      };
-      addBotMsg(msgs[event.error] || "Voice error. Please try again.");
-    };
-
-    r.onend = () => {
-      if (listeningRef.current && !pausedForSpeech.current) {
-        try { r.start(); } catch {}
-      }
-    };
-
-    recognitionRef.current = r;
-    setListening(true);
-    listeningRef.current = true;
-    try { r.start(); } catch {}
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addBotMsg]);
 
   const stopVoice = () => {
     setListening(false);
@@ -173,22 +191,16 @@ function App() {
     try { recognitionRef.current?.stop(); } catch {}
   };
 
-  // ── Cheque upload (called from visible button click — real user gesture) ──
-  const triggerChequeUpload = () => {
-    fileInputRef.current?.click();
-  };
+  const triggerChequeUpload = () => fileInputRef.current?.click();
 
   const uploadCheque = async (file: File) => {
     setAwaitingCheque(false);
-
     if (!file.type.startsWith("image/")) {
       addBotMsg("Invalid file. Please upload a JPG or PNG image of the cheque.");
       return;
     }
-
     setChat((prev) => [...prev, { user: `📎 ${file.name}` }]);
     addBotMsg("Analysing your cheque…");
-
     const formData = new FormData();
     formData.append("file", file);
     try {
@@ -200,7 +212,6 @@ function App() {
     }
   };
 
-  // ── KYC ──
   const startKYC = async () => {
     addBotMsg("Starting KYC. Please look at the camera.");
     setKycActive(true);
@@ -247,120 +258,50 @@ function App() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Plus Jakarta Sans', -apple-system, sans-serif; background: #eef0f4; min-height: 100vh; }
 
-        body {
-          font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
-          background: #eef0f4;
-          min-height: 100vh;
-        }
+        .app { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px 16px; gap: 16px; }
 
-        .app {
-          min-height: 100vh;
-          display: flex; flex-direction: column;
-          align-items: center; justify-content: center;
-          padding: 24px 16px; gap: 16px;
-        }
-
-        /* ── Brand ── */
-        .brand {
-          display: flex; align-items: center; gap: 13px;
-        }
-        .brand-logo {
-          width: 44px; height: 44px; border-radius: 12px;
-          background: #1b3060;
-          display: flex; align-items: center; justify-content: center;
-          font-size: 22px;
-          box-shadow: 0 4px 12px rgba(27,48,96,0.25);
-        }
+        .brand { display: flex; align-items: center; gap: 13px; }
+        .brand-logo { width: 44px; height: 44px; border-radius: 12px; background: #1b3060; display: flex; align-items: center; justify-content: center; font-size: 22px; box-shadow: 0 4px 12px rgba(27,48,96,0.25); }
         .brand-name { font-size: 20px; font-weight: 700; color: #1b3060; letter-spacing: -0.3px; }
         .brand-sub  { font-size: 11px; color: #94a3b8; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.06em; }
 
-        /* ── KYC badge ── */
-        .kyc-badge {
-          display: flex; align-items: center; gap: 8px;
-          font-size: 12px; font-weight: 600; color: #dc2626;
-          background: #fff1f1; border: 1px solid #fecaca;
-          padding: 6px 14px; border-radius: 20px;
-        }
+        .kyc-badge { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: #dc2626; background: #fff1f1; border: 1px solid #fecaca; padding: 6px 14px; border-radius: 20px; }
         .kyc-pulse { width: 7px; height: 7px; border-radius: 50%; background: #dc2626; animation: blink 0.75s infinite; }
 
         video { display: none; width: 100%; max-width: 700px; border-radius: 12px; border: 2px solid #1b3060; }
 
-        /* ── Window ── */
-        .window {
-          width: 100%; max-width: 700px;
-          background: #fff;
-          border-radius: 20px;
-          box-shadow: 0 4px 32px rgba(0,0,0,0.1), 0 1px 4px rgba(0,0,0,0.06);
-          display: flex; flex-direction: column;
-          height: 74vh;
-          overflow: hidden;
-        }
+        .window { width: 100%; max-width: 700px; background: #fff; border-radius: 20px; box-shadow: 0 4px 32px rgba(0,0,0,0.1), 0 1px 4px rgba(0,0,0,0.06); display: flex; flex-direction: column; height: 74vh; overflow: hidden; position: relative; }
 
-        /* ── Topbar ── */
-        .topbar {
-          padding: 14px 20px;
-          border-bottom: 1px solid #f1f5f9;
-          display: flex; align-items: center; justify-content: space-between;
-          background: #fff;
-        }
-        .session-status {
-          display: flex; align-items: center; gap: 8px;
-          font-size: 13px; color: #475569; font-weight: 500;
-        }
+        .topbar { padding: 14px 20px; border-bottom: 1px solid #f1f5f9; display: flex; align-items: center; justify-content: space-between; background: #fff; }
+        .session-status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #475569; font-weight: 500; }
         .dot-live { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 2px #dcfce7; }
 
-        /* ── Voice indicator ── */
         .voice-area { display: flex; align-items: center; gap: 10px; }
-
-        .voice-chip {
-          display: flex; align-items: center; gap: 6px;
-          padding: 5px 12px; border-radius: 20px;
-          font-size: 12px; font-weight: 600;
-          transition: all 0.2s;
-        }
+        .voice-chip { display: flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; transition: all 0.2s; }
         .chip-idle     { background: #f8fafc; color: #94a3b8; border: 1px solid #e2e8f0; }
         .chip-on       { background: #f0fdf4; color: #16a34a; border: 1px solid #86efac; }
         .chip-speaking { background: #eff6ff; color: #2563eb; border: 1px solid #93c5fd; }
         .chip-denied   { background: #fff1f1; color: #dc2626; border: 1px solid #fca5a5; }
+        .chip-unavail  { background: #fafafa; color: #94a3b8; border: 1px solid #e2e8f0; }
 
-        /* Sound wave bars */
         .bars { display: flex; align-items: center; gap: 2px; height: 14px; }
-        .bars span {
-          display: block; width: 3px; border-radius: 3px;
-          background: #16a34a;
-          animation: wav 0.9s ease-in-out infinite;
-        }
+        .bars span { display: block; width: 3px; border-radius: 3px; background: #16a34a; animation: wav 0.9s ease-in-out infinite; }
         .bars span:nth-child(2) { animation-delay: 0.15s; }
         .bars span:nth-child(3) { animation-delay: 0.3s; }
         @keyframes wav { 0%,100%{height:3px} 50%{height:13px} }
 
-        .mic-toggle {
-          padding: 6px 14px; border-radius: 20px;
-          font-size: 12px; font-weight: 600; font-family: inherit;
-          cursor: pointer; border: 1.5px solid #1b3060;
-          background: transparent; color: #1b3060;
-          transition: all 0.15s;
-        }
+        .mic-toggle { padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer; border: 1.5px solid #1b3060; background: transparent; color: #1b3060; transition: all 0.15s; }
         .mic-toggle:hover { background: #f0f4ff; }
         .mic-toggle.mute { border-color: #ef4444; color: #ef4444; }
         .mic-toggle.mute:hover { background: #fff1f1; }
+        .mic-toggle:disabled { opacity: 0.4; cursor: not-allowed; }
 
-        /* ── Permission warning ── */
-        .perm-warn {
-          margin: 8px 18px 0;
-          padding: 8px 14px;
-          background: #fff7ed; border: 1px solid #fed7aa;
-          border-radius: 8px; font-size: 12px; color: #92400e;
-        }
+        .perm-warn    { margin: 8px 18px 0; padding: 8px 14px; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; font-size: 12px; color: #92400e; }
+        .network-warn { margin: 8px 18px 0; padding: 8px 14px; background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; font-size: 12px; color: #0369a1; }
 
-        /* ── Messages ── */
-        .msgs {
-          flex: 1; overflow-y: auto; padding: 20px 18px;
-          display: flex; flex-direction: column; gap: 14px;
-          background: #f8fafc;
-          scroll-behavior: smooth;
-        }
+        .msgs { flex: 1; overflow-y: auto; padding: 20px 18px; display: flex; flex-direction: column; gap: 14px; background: #f8fafc; scroll-behavior: smooth; }
         .msgs::-webkit-scrollbar { width: 4px; }
         .msgs::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 4px; }
 
@@ -368,91 +309,45 @@ function App() {
         .row.user { justify-content: flex-end; }
         .row.bot  { justify-content: flex-start; align-items: flex-end; gap: 9px; }
 
-        .av {
-          width: 30px; height: 30px; border-radius: 50%;
-          background: #1b3060; color: #fff;
-          font-size: 13px; font-weight: 700;
-          display: flex; align-items: center; justify-content: center;
-          flex-shrink: 0; margin-bottom: 2px;
-          box-shadow: 0 2px 8px rgba(27,48,96,0.2);
-        }
+        .av { width: 30px; height: 30px; border-radius: 50%; background: #1b3060; color: #fff; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-bottom: 2px; box-shadow: 0 2px 8px rgba(27,48,96,0.2); }
 
-        .bubble {
-          max-width: 66%; padding: 10px 15px;
-          font-size: 14px; line-height: 1.55;
-          border-radius: 18px;
-        }
-        .bubble.user {
-          background: #1b3060; color: #fff;
-          border-bottom-right-radius: 4px;
-          box-shadow: 0 2px 8px rgba(27,48,96,0.2);
-        }
-        .bubble.bot {
-          background: #fff; color: #1e293b;
-          border: 1px solid #e8edf3;
-          border-bottom-left-radius: 4px;
-          box-shadow: 0 1px 4px rgba(0,0,0,0.06);
-        }
+        .bubble { max-width: 66%; padding: 10px 15px; font-size: 14px; line-height: 1.55; border-radius: 18px; }
+        .bubble.user { background: #1b3060; color: #fff; border-bottom-right-radius: 4px; box-shadow: 0 2px 8px rgba(27,48,96,0.2); }
+        .bubble.bot  { background: #fff; color: #1e293b; border: 1px solid #e8edf3; border-bottom-left-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
 
-        /* ── Cheque upload button (shown inside chat) ── */
-        .upload-card {
-          background: #fff; border: 2px dashed #93c5fd;
-          border-radius: 14px; padding: 18px 20px;
-          display: flex; flex-direction: column; align-items: center; gap: 10px;
-          max-width: 280px;
-        }
+        .typing-bubble { display: flex; gap: 5px; align-items: center; padding: 14px 18px; }
+        .dot { width: 7px; height: 7px; border-radius: 50%; background: #94a3b8; display: inline-block; animation: bounce 1.2s infinite; }
+        .dot:nth-child(2) { animation-delay: 0.2s; }
+        .dot:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes bounce { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-6px)} }
+
+        .upload-card { background: #fff; border: 2px dashed #93c5fd; border-radius: 14px; padding: 18px 20px; display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 280px; }
         .upload-card p { font-size: 13px; color: #475569; text-align: center; line-height: 1.4; }
-        .upload-btn {
-          display: flex; align-items: center; gap: 7px;
-          padding: 9px 20px; border-radius: 22px;
-          background: #1b3060; color: #fff;
-          font-size: 13px; font-weight: 600; font-family: inherit;
-          border: none; cursor: pointer;
-          transition: opacity 0.15s;
-        }
+        .upload-btn { display: flex; align-items: center; gap: 7px; padding: 9px 20px; border-radius: 22px; background: #1b3060; color: #fff; font-size: 13px; font-weight: 600; font-family: inherit; border: none; cursor: pointer; transition: opacity 0.15s; }
         .upload-btn:hover { opacity: 0.85; }
 
-        /* ── Input fallback ── */
-        .inputbar {
-          padding: 12px 16px; border-top: 1px solid #f1f5f9;
-          display: flex; gap: 8px; align-items: center;
-          background: #fff;
-        }
-        .fallback-label {
-          font-size: 10px; font-weight: 700; color: #cbd5e1;
-          letter-spacing: 0.08em; white-space: nowrap;
-        }
-        .chat-input {
-          flex: 1; padding: 10px 16px;
-          border: 1.5px solid #e8edf3; border-radius: 24px;
-          font-family: inherit; font-size: 14px; color: #1e293b;
-          outline: none; background: #f8fafc;
-          transition: border-color 0.15s, background 0.15s;
-        }
+        .start-overlay { position: absolute; inset: 0; z-index: 10; background: rgba(248,250,252,0.97); display: flex; align-items: center; justify-content: center; border-radius: 20px; cursor: pointer; }
+        .start-card { display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 32px; text-align: center; }
+        .start-icon { font-size: 52px; }
+        .start-card h2 { font-size: 22px; font-weight: 700; color: #1b3060; }
+        .start-card p  { font-size: 14px; color: #64748b; max-width: 260px; line-height: 1.6; }
+        .start-btn { padding: 13px 36px; border-radius: 28px; background: #1b3060; color: #fff; font-size: 15px; font-weight: 700; font-family: inherit; border: none; cursor: pointer; box-shadow: 0 4px 16px rgba(27,48,96,0.3); transition: opacity 0.15s; }
+        .start-btn:hover { opacity: 0.85; }
+
+        .inputbar { padding: 12px 16px; border-top: 1px solid #f1f5f9; display: flex; gap: 8px; align-items: center; background: #fff; }
+        .fallback-label { font-size: 10px; font-weight: 700; color: #cbd5e1; letter-spacing: 0.08em; white-space: nowrap; }
+        .chat-input { flex: 1; padding: 10px 16px; border: 1.5px solid #e8edf3; border-radius: 24px; font-family: inherit; font-size: 14px; color: #1e293b; outline: none; background: #f8fafc; transition: border-color 0.15s, background 0.15s; }
         .chat-input::placeholder { color: #94a3b8; }
         .chat-input:focus { border-color: #1b3060; background: #fff; }
-
-        .send-btn {
-          width: 40px; height: 40px; border-radius: 50%;
-          background: #1b3060; color: #fff;
-          border: none; cursor: pointer; font-size: 16px;
-          display: flex; align-items: center; justify-content: center;
-          flex-shrink: 0; box-shadow: 0 2px 8px rgba(27,48,96,0.25);
-          transition: opacity 0.15s;
-        }
+        .send-btn { width: 40px; height: 40px; border-radius: 50%; background: #1b3060; color: #fff; border: none; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: 0 2px 8px rgba(27,48,96,0.25); transition: opacity 0.15s; }
         .send-btn:hover { opacity: 0.82; }
 
-        .footer-txt {
-          font-size: 10px; color: #94a3b8;
-          text-transform: uppercase; letter-spacing: 0.1em;
-        }
+        .footer-txt { font-size: 10px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.1em; }
 
         @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
       `}</style>
 
       <div className="app">
-
-        {/* Brand */}
         <div className="brand">
           <div className="brand-logo">🏦</div>
           <div>
@@ -461,26 +356,31 @@ function App() {
           </div>
         </div>
 
-        {/* KYC recording badge */}
         {kycActive && (
           <div className="kyc-badge">
             <div className="kyc-pulse" /> KYC recording in progress…
           </div>
         )}
 
-        {/* KYC video preview */}
         <video ref={videoRef} autoPlay muted />
 
-        {/* Main window */}
         <div className="window">
+          {!started && (
+            <div className="start-overlay" onClick={handleStart}>
+              <div className="start-card">
+                <div className="start-icon">🏦</div>
+                <h2>Kentiq AI Banking</h2>
+                <p>Tap to start your voice banking session. Microphone access will be requested.</p>
+                <button className="start-btn">🎤 Tap to Begin</button>
+              </div>
+            </div>
+          )}
 
-          {/* Topbar */}
           <div className="topbar">
             <div className="session-status">
               <div className="dot-live" />
               Secure session active
             </div>
-
             <div className="voice-area">
               {listening && !botSpeaking && (
                 <div className="voice-chip chip-on">
@@ -491,30 +391,38 @@ function App() {
               {botSpeaking && (
                 <div className="voice-chip chip-speaking">🔊 Speaking…</div>
               )}
-              {!listening && !botSpeaking && !permDenied && (
+              {!listening && !botSpeaking && !permDenied && !voiceUnsupported && (
                 <div className="voice-chip chip-idle">Mic off</div>
               )}
               {permDenied && (
                 <div className="voice-chip chip-denied">🚫 Blocked</div>
               )}
-
-              <button
-                className={`mic-toggle ${listening ? "mute" : ""}`}
-                onClick={listening ? stopVoice : startVoice}
-              >
-                {listening ? "Mute" : "🎤 Start"}
-              </button>
+              {voiceUnsupported && (
+                <div className="voice-chip chip-unavail">⌨️ Type only</div>
+              )}
+              {!voiceUnsupported && (
+                <button
+                  className={`mic-toggle ${listening ? "mute" : ""}`}
+                  onClick={listening ? stopVoice : startVoice}
+                  disabled={permDenied}
+                >
+                  {listening ? "Mute" : "🎤 Start"}
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Permission warning */}
           {permDenied && (
             <div className="perm-warn">
-              ⚠️ Mic access blocked — click the 🔒 in your browser bar, allow microphone, then refresh.
+              ⚠️ Mic blocked — click 🔒 in your browser bar, allow microphone, then refresh.
+            </div>
+          )}
+          {networkErrCount.current > 0 && !permDenied && (
+            <div className="network-warn">
+              ℹ️ Voice input unavailable on this network — please type your messages below.
             </div>
           )}
 
-          {/* Messages */}
           <div className="msgs">
             {chat.map((c, i) => (
               <div key={i}>
@@ -532,7 +440,17 @@ function App() {
               </div>
             ))}
 
-            {/* ── Cheque upload card — appears inside chat, real user gesture ── */}
+            {botTyping && (
+              <div className="row bot">
+                <div className="av">K</div>
+                <div className="bubble bot typing-bubble">
+                  <span className="dot" />
+                  <span className="dot" />
+                  <span className="dot" />
+                </div>
+              </div>
+            )}
+
             {awaitingCheque && (
               <div className="row bot">
                 <div className="av">K</div>
@@ -548,7 +466,6 @@ function App() {
             <div ref={chatEndRef} />
           </div>
 
-          {/* Text fallback */}
           <div className="inputbar">
             <span className="fallback-label">TYPE</span>
             <input
@@ -565,7 +482,6 @@ function App() {
         <p className="footer-txt">256-bit encrypted · Powered by Kentiq AI</p>
       </div>
 
-      {/* Hidden file input — triggered only by real button click above */}
       <input
         type="file"
         accept="image/*"
