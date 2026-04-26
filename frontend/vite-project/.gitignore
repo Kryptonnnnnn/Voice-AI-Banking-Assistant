@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.env
+backend/.env
+
+# Node
+node_modules/
+dist/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
