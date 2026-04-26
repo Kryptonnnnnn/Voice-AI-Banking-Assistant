@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState, useEffect } from "react";
 
 export default function VoiceRecorder({ onResult }: any) {
   const [listening, setListening] = useState(false);

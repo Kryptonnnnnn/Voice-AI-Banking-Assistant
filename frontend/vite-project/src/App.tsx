@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 
 const BASE_URL = "https://voice-ai-banking-assistant-1.onrender.com";
 
