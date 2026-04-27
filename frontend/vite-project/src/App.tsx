@@ -2,6 +2,19 @@ import { useEffect, useRef, useState, useCallback } from "react";
 
 const BASE_URL = "https://voice-ai-banking-assistant-1.onrender.com";
 
+const getSpeechRecognition = () =>
+  (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition || null;
+
+const isVoiceSupported = (): boolean => {
+  const SR = getSpeechRecognition();
+  if (!SR) return false;
+  const ua = navigator.userAgent;
+  const isIOS = /iPhone|iPad|iPod/i.test(ua);
+  const isSafariOnly = /^((?!chrome|android).)*safari/i.test(ua);
+  if (isIOS || isSafariOnly) return false;
+  return true;
+};
+
 function App() {
   const [chat, setChat]               = useState<any[]>([]);
   const [input, setInput]             = useState("");
@@ -12,7 +25,8 @@ function App() {
   const [permDenied, setPermDenied]   = useState(false);
   const [awaitingCheque, setAwaitingCheque] = useState(false);
   const [started, setStarted]         = useState(false);
-  const [voiceUnsupported, setVoiceUnsupported] = useState(false);
+  const [voiceUnsupported]            = useState(() => !isVoiceSupported());
+  const [networkBlocked, setNetworkBlocked] = useState(false);
   const [botTyping, setBotTyping]     = useState(false);
 
   const recognitionRef   = useRef<any>(null);
@@ -22,8 +36,8 @@ function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const listeningRef     = useRef(false);
   const pausedForSpeech  = useRef(false);
-  const networkErrCount  = useRef(0);
   const finishTimerRef   = useRef<any>(null);
+  const voiceKilledRef   = useRef(false);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -31,10 +45,18 @@ function App() {
 
   useEffect(() => { listeningRef.current = listening; }, [listening]);
 
+  const killVoice = useCallback(() => {
+    voiceKilledRef.current = true;
+    setListening(false);
+    listeningRef.current = false;
+    try { recognitionRef.current?.stop(); } catch {}
+    recognitionRef.current = null;
+  }, []);
+
   const resumeMic = useCallback(() => {
     pausedForSpeech.current = false;
     setBotSpeaking(false);
-    if (listeningRef.current && recognitionRef.current) {
+    if (listeningRef.current && recognitionRef.current && !voiceKilledRef.current) {
       try { recognitionRef.current.start(); } catch {}
     }
   }, []);
@@ -65,19 +87,20 @@ function App() {
 
     utter.onend   = finish;
     utter.onerror = finish;
-
-    const estimatedMs = Math.min(text.length * 60, 12000);
-    finishTimerRef.current = setTimeout(finish, estimatedMs + 1500);
-
+    finishTimerRef.current = setTimeout(finish, Math.min(text.length * 60, 12000) + 1500);
     speechSynthesis.speak(utter);
   }, [resumeMic]);
 
-  const startVoice = useCallback(() => {
-    const SR =
-      (window as any).webkitSpeechRecognition ||
-      (window as any).SpeechRecognition;
+  const addBotMsg = useCallback((text: string) => {
+    setChat((prev) => [...prev, { bot: text }]);
+    speak(text);
+  }, [speak]);
 
-    if (!SR) { setVoiceUnsupported(true); return; }
+  const startVoice = useCallback(() => {
+    if (voiceUnsupported || voiceKilledRef.current) return;
+
+    const SR = getSpeechRecognition();
+    if (!SR) return;
     if (recognitionRef.current && listeningRef.current) return;
 
     const r = new SR();
@@ -87,7 +110,6 @@ function App() {
     r.maxAlternatives = 1;
 
     r.onstart = () => {
-      networkErrCount.current = 0;
       if (!pausedForSpeech.current) setListening(true);
     };
 
@@ -103,44 +125,42 @@ function App() {
 
     r.onerror = (event: any) => {
       if (event.error === "aborted" || event.error === "no-speech") return;
+
       if (event.error === "not-allowed") {
-        setListening(false); listeningRef.current = false; setPermDenied(true); return;
+        killVoice();
+        setPermDenied(true);
+        return;
       }
       if (event.error === "audio-capture") {
-        setListening(false); listeningRef.current = false; return;
+        killVoice();
+        return;
       }
       if (event.error === "network") {
-        networkErrCount.current += 1;
-        if (networkErrCount.current === 1) {
-          setChat((prev) => [...prev, { bot: "Voice recognition is unavailable on this network. Please type your messages below." }]);
-        }
-        setListening(false); listeningRef.current = false; return;
+        killVoice();
+        setNetworkBlocked(true);
+        return;
       }
     };
 
     r.onend = () => {
-      if (listeningRef.current && !pausedForSpeech.current) {
+      if (listeningRef.current && !pausedForSpeech.current && !voiceKilledRef.current) {
         try { r.start(); } catch {}
       }
     };
 
     recognitionRef.current = r;
+    voiceKilledRef.current = false;
     setListening(true);
     listeningRef.current = true;
     try { r.start(); } catch {}
-  }, []);
-
-  const addBotMsg = useCallback((text: string) => {
-    setChat((prev) => [...prev, { bot: text }]);
-    speak(text);
-  }, [speak]);
+  }, [voiceUnsupported, killVoice]);
 
   const handleStart = () => {
     setStarted(true);
     const msg = "Welcome to Kentiq AI Voice Banking. How can I help you?";
     setChat([{ bot: msg }]);
     speak(msg);
-    startVoice();
+    if (!voiceUnsupported) startVoice();
   };
 
   const sendText = async (text: string) => {
@@ -253,6 +273,8 @@ function App() {
     await handleUser(text);
   };
 
+  const showVoiceUnavailable = voiceUnsupported || networkBlocked;
+
   return (
     <>
       <style>{`
@@ -298,8 +320,10 @@ function App() {
         .mic-toggle.mute:hover { background: #fff1f1; }
         .mic-toggle:disabled { opacity: 0.4; cursor: not-allowed; }
 
-        .perm-warn    { margin: 8px 18px 0; padding: 8px 14px; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; font-size: 12px; color: #92400e; }
-        .network-warn { margin: 8px 18px 0; padding: 8px 14px; background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; font-size: 12px; color: #0369a1; }
+        .banner { margin: 8px 18px 0; padding: 9px 14px; border-radius: 8px; font-size: 12px; display: flex; align-items: center; gap: 8px; }
+        .banner-warn    { background: #fff7ed; border: 1px solid #fed7aa; color: #92400e; }
+        .banner-network { background: #f0f9ff; border: 1px solid #bae6fd; color: #0369a1; }
+        .banner-safari  { background: #fefce8; border: 1px solid #fde68a; color: #92400e; }
 
         .msgs { flex: 1; overflow-y: auto; padding: 20px 18px; display: flex; flex-direction: column; gap: 14px; background: #f8fafc; scroll-behavior: smooth; }
         .msgs::-webkit-scrollbar { width: 4px; }
@@ -333,6 +357,7 @@ function App() {
         .start-card p  { font-size: 14px; color: #64748b; max-width: 260px; line-height: 1.6; }
         .start-btn { padding: 13px 36px; border-radius: 28px; background: #1b3060; color: #fff; font-size: 15px; font-weight: 700; font-family: inherit; border: none; cursor: pointer; box-shadow: 0 4px 16px rgba(27,48,96,0.3); transition: opacity 0.15s; }
         .start-btn:hover { opacity: 0.85; }
+        .start-note { font-size: 11px; color: #94a3b8; max-width: 240px; }
 
         .inputbar { padding: 12px 16px; border-top: 1px solid #f1f5f9; display: flex; gap: 8px; align-items: center; background: #fff; }
         .fallback-label { font-size: 10px; font-weight: 700; color: #cbd5e1; letter-spacing: 0.08em; white-space: nowrap; }
@@ -370,8 +395,17 @@ function App() {
               <div className="start-card">
                 <div className="start-icon">🏦</div>
                 <h2>Kentiq AI Banking</h2>
-                <p>Tap to start your voice banking session. Microphone access will be requested.</p>
-                <button className="start-btn">🎤 Tap to Begin</button>
+                {voiceUnsupported ? (
+                  <p>Voice is not supported on this browser. You can type all commands below — everything works via text.</p>
+                ) : (
+                  <p>Tap to start your voice banking session. Microphone access will be requested.</p>
+                )}
+                <button className="start-btn">
+                  {voiceUnsupported ? "💬 Tap to Begin" : "🎤 Tap to Begin"}
+                </button>
+                {!voiceUnsupported && (
+                  <span className="start-note">Works best on Chrome or Edge on desktop</span>
+                )}
               </div>
             </div>
           )}
@@ -391,16 +425,16 @@ function App() {
               {botSpeaking && (
                 <div className="voice-chip chip-speaking">🔊 Speaking…</div>
               )}
-              {!listening && !botSpeaking && !permDenied && !voiceUnsupported && (
+              {!listening && !botSpeaking && !permDenied && !showVoiceUnavailable && (
                 <div className="voice-chip chip-idle">Mic off</div>
               )}
               {permDenied && (
                 <div className="voice-chip chip-denied">🚫 Blocked</div>
               )}
-              {voiceUnsupported && (
+              {showVoiceUnavailable && !permDenied && (
                 <div className="voice-chip chip-unavail">⌨️ Type only</div>
               )}
-              {!voiceUnsupported && (
+              {!showVoiceUnavailable && !voiceUnsupported && (
                 <button
                   className={`mic-toggle ${listening ? "mute" : ""}`}
                   onClick={listening ? stopVoice : startVoice}
@@ -413,13 +447,18 @@ function App() {
           </div>
 
           {permDenied && (
-            <div className="perm-warn">
+            <div className="banner banner-warn">
               ⚠️ Mic blocked — click 🔒 in your browser bar, allow microphone, then refresh.
             </div>
           )}
-          {networkErrCount.current > 0 && !permDenied && (
-            <div className="network-warn">
-              ℹ️ Voice input unavailable on this network — please type your messages below.
+          {networkBlocked && !permDenied && (
+            <div className="banner banner-network">
+              ℹ️ Voice unavailable on this network — type your messages below, all features work.
+            </div>
+          )}
+          {voiceUnsupported && !networkBlocked && !permDenied && (
+            <div className="banner banner-safari">
+              ⚠️ Voice not supported on Safari/iOS — please use Chrome or Edge, or type below.
             </div>
           )}
 
@@ -473,7 +512,7 @@ function App() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && send()}
-              placeholder="Or type here as a fallback…"
+              placeholder={showVoiceUnavailable ? "Type your message here…" : "Or type here as a fallback…"}
             />
             <button className="send-btn" onClick={send}>↑</button>
           </div>
